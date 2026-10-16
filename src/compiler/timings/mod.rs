@@ -141,6 +141,7 @@ impl<'gctx> Timings<'gctx> {
             CompileMode::Doctest => target.push_str(" (doc test)"),
             CompileMode::Docscrape => target.push_str(" (doc scrape)"),
             CompileMode::RunCustomBuild => target.push_str(" (run)"),
+            CompileMode::OffloadMetadata { .. } => target.push_str(" (offload metadata)"),
         }
         let start = self.start.elapsed().as_secs_f64();
         logger.log(LogMessage::UnitStarted {

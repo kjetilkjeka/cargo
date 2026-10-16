@@ -61,6 +61,7 @@ use crate::util::machine_message::Message as _;
 use crate::util::{CargoResult, StableHasher};
 use crate::workspace::profiles::Profiles;
 use crate::workspace::{PackageId, PackageSet, SourceId, TargetKind, Workspace};
+use anyhow::Context as _;
 
 mod compile_filter;
 use cargo_util_terminal::report::{Group, Level, Origin};
@@ -296,6 +297,20 @@ pub fn create_bcx<'a, 'gctx>(
 
     let mut target_data = RustcTargetData::new(ws, &build_config.requested_kinds)?;
 
+    // The device target of `-Z offload` is a compile kind that no `--target`
+    // mentions; register it before anything evaluates `cfg(..)` for it.
+    let offload_target = crate::compiler::offload::device_target(gctx)?;
+    if let Some(target) = offload_target {
+        target_data
+            .merge_compile_kind(CompileKind::Target(target))
+            .with_context(|| {
+                format!(
+                    "failed to determine target information for the offload device target `{}`",
+                    target.rustc_target()
+                )
+            })?;
+    }
+
     let specs = spec.to_package_id_specs(ws)?;
     let has_dev_units = {
         // Rustdoc itself doesn't need dev-dependencies. But to scrape examples from packages in the
@@ -347,14 +362,23 @@ pub fn create_bcx<'a, 'gctx>(
         logger.log(LogMessage::ResolutionFinished { elapsed });
     }
 
+    // The kinds `-Zbuild-std` builds the standard library for. An offload
+    // build without `--target` needs it for the device only: the host keeps
+    // using the sysroot, which is also what makes `libomptarget` available.
+    let std_kinds: Vec<CompileKind> = match offload_target {
+        Some(target) => build_config
+            .requested_kinds
+            .iter()
+            .filter(|kind| !kind.is_host())
+            .copied()
+            .chain(std::iter::once(CompileKind::Target(target)))
+            .collect(),
+        None => build_config.requested_kinds.clone(),
+    };
+
     let std_resolve_features = if let Some(crates) = &gctx.cli_unstable().build_std {
-        let (std_package_set, std_resolve, std_features) = standard_lib::resolve_std(
-            ws,
-            &mut target_data,
-            &build_config,
-            crates,
-            &build_config.requested_kinds,
-        )?;
+        let (std_package_set, std_resolve, std_features) =
+            standard_lib::resolve_std(ws, &mut target_data, &build_config, crates, &std_kinds)?;
         pkg_set.add_set(std_package_set);
         Some((std_resolve, std_features))
     } else {
@@ -404,6 +428,7 @@ pub fn create_bcx<'a, 'gctx>(
     }
 
     let profiles = Profiles::new(ws, build_config.requested_profile)?;
+    //profiles.set_offload_target(offload_target); // TODO(@kjetilkjeka) Find out what this was for?
     profiles.validate_packages(
         ws.profiles(),
         &mut gctx.shell(),
@@ -468,6 +493,7 @@ pub fn create_bcx<'a, 'gctx>(
             profiles: &profiles,
             interner,
             has_dev_units,
+            offload: offload_target,
         };
         let (mut targeted_root_units, curr_selected_dep_kinds) = generator.generate_root_units()?;
         // Should be fine as the loop iterate is independent of target selection
@@ -487,12 +513,17 @@ pub fn create_bcx<'a, 'gctx>(
 
         let std_roots = if let Some(crates) = gctx.cli_unstable().build_std.as_ref() {
             let (std_resolve, std_features) = std_resolve_features.as_ref().unwrap();
+            let std_root_kinds: Vec<CompileKind> = if offload_target.is_some() {
+                std_kinds.clone()
+            } else {
+                explicit_host_kinds.clone()
+            };
             standard_lib::generate_std_roots(
                 &crates,
                 &targeted_root_units,
                 std_resolve,
                 std_features,
-                &explicit_host_kinds,
+                &std_root_kinds,
                 &pkg_set,
                 interner,
                 &profiles,
@@ -979,6 +1010,7 @@ fn traverse_and_share(
             unit.artifact,
             unit.artifact_target_for_features,
             unit.skip_non_compile_time_dep,
+            unit.offload.clone(),
         );
 
         // We can now turn the deferred value into its actual final value.
@@ -1010,6 +1042,7 @@ fn traverse_and_share(
         // for target-dependent feature resolution
         None,
         skip_non_compile_time_deps,
+        unit.offload.clone(),
     );
     if !unit_is_root || !compile_time_deps_only {
         assert!(memo.insert(unit.clone(), new_unit.clone()).is_none());
@@ -1175,6 +1208,7 @@ fn override_rustc_crate_types(
             unit.artifact,
             unit.artifact_target_for_features,
             unit.skip_non_compile_time_dep,
+            unit.offload.clone(),
         )
     };
     units[0] = match unit.target.kind() {

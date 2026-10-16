@@ -603,6 +603,14 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
                     flavor: FileFlavor::Normal,
                 }]
             }
+            CompileMode::OffloadMetadata { .. } => {
+                vec![OutputFile {
+                    path: self.offload_manifest_path(unit),
+                    hardlink: None,
+                    export_path: None,
+                    flavor: FileFlavor::Normal,
+                }]
+            }
             CompileMode::Test | CompileMode::Build | CompileMode::Check { .. } => {
                 let mut outputs = self.calc_outputs_rustc(unit, bcx)?;
                 if bcx.build_config.sbom && bcx.gctx.cli_unstable().sbom {
@@ -645,6 +653,24 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
         debug!("Target filenames: {:?}", ret);
 
         Ok(Arc::new(ret))
+    }
+
+    /// The kernel manifest written by an offload host-metadata unit.
+    pub fn offload_manifest_path(&self, unit: &Unit) -> PathBuf {
+        let crate_name = unit.target.crate_name();
+        let name = match self.metadata(unit).c_extra_filename() {
+            Some(hash) => format!("{crate_name}-{hash}.offload-manifest"),
+            None => format!("{crate_name}.offload-manifest"),
+        };
+        self.output_dir(unit).join(name)
+    }
+
+    /// The device image written by an offload device unit. rustc fixes the
+    /// file name and writes it next to the unit's object file.
+    pub fn offload_device_image_path(&self, unit: &Unit) -> PathBuf {
+        self.output_dir(unit)
+            .join(unit.target.crate_name()) // TODO: When should this be crate name and when "name"??
+            .with_extension("ptx")
     }
 
     /// Append the SBOM suffix to the file name.

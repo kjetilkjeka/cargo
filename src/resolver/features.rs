@@ -45,7 +45,7 @@ use crate::util::CargoResult;
 use crate::util::data_structures::{HashMap, HashSet};
 use crate::util::interning::{INTERNED_DEFAULT, InternedString};
 use crate::workspace::dependency::{ArtifactTarget, DepKind, Dependency};
-use crate::workspace::{FeatureValue, PackageId, PackageIdSpec, PackageSet, Workspace};
+use crate::workspace::{FeatureValue, PackageId, PackageIdSpec, PackageSet, Summary, Workspace};
 use anyhow::{Context, bail};
 use itertools::Itertools;
 use std::collections::{BTreeMap, BTreeSet};
@@ -120,6 +120,13 @@ pub enum FeaturesFor {
     ///
     /// That is, `dep = { …, artifact = <crate-type>, target = <tuple> }`
     ArtifactDep(CompileTarget),
+    /// A unit of the offload device graph (`-Z offload`), compiled for the
+    /// given device target.
+    ///
+    /// Features in this context follow the `offload` keys of the manifests
+    /// instead of the host requests; packages still unify across all edges
+    /// within the context.
+    Offload(CompileTarget),
 }
 
 impl std::fmt::Display for FeaturesFor {
@@ -127,6 +134,7 @@ impl std::fmt::Display for FeaturesFor {
         match self {
             FeaturesFor::HostDep => f.write_str("host"),
             FeaturesFor::ArtifactDep(target) => f.write_str(&target.rustc_target()),
+            FeaturesFor::Offload(target) => write!(f, "offload:{}", target.rustc_target()),
             FeaturesFor::NormalOrDev => Ok(()),
         }
     }
@@ -158,7 +166,9 @@ impl FeaturesFor {
     }
 
     fn apply_opts(self, opts: &FeatureOpts) -> Self {
-        if opts.decouple_host_deps {
+        if opts.decouple_host_deps || matches!(self, FeaturesFor::Offload(_)) {
+            // The device context never unifies with the host, whatever the
+            // resolver version: its requests come from different manifest keys.
             self
         } else {
             FeaturesFor::default()
@@ -440,6 +450,10 @@ pub struct FeatureResolver<'a, 'gctx> {
     /// set of features to activate.
     deferred_weak_dependencies:
         HashMap<(PackageId, FeaturesFor, InternedString), HashSet<InternedString>>,
+    /// The offload device target (`-Z offload`), if a device graph is built.
+    /// Every selected member is then also activated in the
+    /// [`FeaturesFor::Offload`] context.
+    offload_target: Option<CompileTarget>,
 }
 
 impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
@@ -457,6 +471,17 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         opts: FeatureOpts,
     ) -> CargoResult<ResolvedFeatures> {
         let track_for_host = opts.decouple_host_deps || opts.ignore_inactive_targets;
+        let offload_target = crate::compiler::offload::device_target(ws.gctx())?;
+        if let Some(target) = offload_target {
+            target_data
+                .merge_compile_kind(CompileKind::Target(target))
+                .with_context(|| {
+                    format!(
+                        "failed to determine target information for the offload device target `{}`",
+                        target.rustc_target()
+                    )
+                })?;
+        }
         let mut r = FeatureResolver {
             ws,
             target_data,
@@ -469,6 +494,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
             processed_deps: HashSet::default(),
             track_for_host,
             deferred_weak_dependencies: HashMap::default(),
+            offload_target,
         };
         r.do_resolve(specs, cli_features)?;
         tracing::debug!("features={:#?}", r.activated_features);
@@ -505,6 +531,14 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                 FeaturesFor::default()
             };
             self.activate_pkg(member.package_id(), fk, &fvs)?;
+            if let Some(target) = self.offload_target {
+                // Proc-macros are host tools and never have a device graph.
+                if fk != FeaturesFor::HostDep {
+                    let fk = FeaturesFor::Offload(target);
+                    let fvs = self.fvs_from_requested_for(member.package_id(), cli_features, fk);
+                    self.activate_pkg(member.package_id(), fk, &fvs)?;
+                }
+            }
         }
         Ok(())
     }
@@ -553,7 +587,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                     continue;
                 }
                 // Recurse into the dependency.
-                let fvs = self.fvs_from_dependency(dep_pkg_id, dep);
+                let fvs = self.fvs_from_dependency(dep_pkg_id, dep, dep_fk);
                 self.activate_pkg(dep_pkg_id, dep_fk, &fvs)?;
             }
         }
@@ -663,7 +697,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                         self.activate_fv(dep_pkg_id, dep_fk, &fv)?;
                     }
                 }
-                let fvs = self.fvs_from_dependency(dep_pkg_id, dep);
+                let fvs = self.fvs_from_dependency(dep_pkg_id, dep, dep_fk);
                 self.activate_pkg(dep_pkg_id, dep_fk, &fvs)?;
             }
         }
@@ -736,18 +770,45 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
     }
 
     /// Returns Vec of `FeatureValues` from a Dependency definition.
-    fn fvs_from_dependency(&self, dep_id: PackageId, dep: &Dependency) -> Vec<FeatureValue> {
+    ///
+    /// `dep_fk` is the context the dependency is activated in; in the offload
+    /// context the edge's `offload` request replaces the host request.
+    fn fvs_from_dependency(
+        &self,
+        dep_id: PackageId,
+        dep: &Dependency,
+        dep_fk: FeaturesFor,
+    ) -> Vec<FeatureValue> {
         let summary = self.resolve.summary(dep_id);
-        let feature_map = summary.features();
-        let mut result: Vec<FeatureValue> = dep
-            .features()
-            .iter()
-            .map(|f| FeatureValue::new(*f))
-            .collect();
-        if dep.uses_default_features() && feature_map.contains_key(&INTERNED_DEFAULT) {
-            result.push(FeatureValue::Feature(INTERNED_DEFAULT));
+        let (features, uses_default_features) = match dep_fk {
+            FeaturesFor::Offload(_) => {
+                (dep.offload_features(), dep.offload_uses_default_features())
+            }
+            _ => (dep.features(), dep.uses_default_features()),
+        };
+        let mut result: Vec<FeatureValue> =
+            features.iter().map(|f| FeatureValue::new(*f)).collect();
+        if uses_default_features {
+            result.extend(Self::default_fvs(summary, dep_fk));
         }
         result
+    }
+
+    /// What requesting "default features" of `summary` means in context `fk`.
+    ///
+    /// On the device, `package.offload-default-features` stands in for the
+    /// `default` feature when it is declared.
+    fn default_fvs(summary: &Summary, fk: FeaturesFor) -> Vec<FeatureValue> {
+        if let FeaturesFor::Offload(_) = fk {
+            if let Some(fvs) = summary.offload_default_features() {
+                return fvs.to_vec();
+            }
+        }
+        if summary.features().contains_key(&INTERNED_DEFAULT) {
+            vec![FeatureValue::Feature(INTERNED_DEFAULT)]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Returns Vec of `FeatureValues` from a set of command-line features.
@@ -756,12 +817,25 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
         pkg_id: PackageId,
         cli_features: &CliFeatures,
     ) -> Vec<FeatureValue> {
+        self.fvs_from_requested_for(pkg_id, cli_features, FeaturesFor::default())
+    }
+
+    /// Like [`Self::fvs_from_requested`], for the given context.
+    ///
+    /// The offload context takes the same command-line features as the host;
+    /// only the meaning of "default features" differs.
+    fn fvs_from_requested_for(
+        &self,
+        pkg_id: PackageId,
+        cli_features: &CliFeatures,
+        fk: FeaturesFor,
+    ) -> Vec<FeatureValue> {
         let summary = self.resolve.summary(pkg_id);
         let feature_map = summary.features();
 
         let mut result: Vec<FeatureValue> = cli_features.features.iter().cloned().collect();
-        if cli_features.uses_default_features && feature_map.contains_key(&INTERNED_DEFAULT) {
-            result.push(FeatureValue::Feature(INTERNED_DEFAULT));
+        if cli_features.uses_default_features {
+            result.extend(Self::default_fvs(summary, fk));
         }
 
         if cli_features.all_features {
@@ -797,7 +871,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                 (_, FeaturesFor::NormalOrDev) => requested_targets
                     .iter()
                     .any(|kind| target_data.dep_platform_activated(dep, *kind)),
-                (_, FeaturesFor::ArtifactDep(target)) => {
+                (_, FeaturesFor::ArtifactDep(target)) | (_, FeaturesFor::Offload(target)) => {
                     target_data.dep_platform_activated(dep, CompileKind::Target(target))
                 }
             }
@@ -884,6 +958,15 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                         if self.opts.decouple_dev_deps && dep.kind() == DepKind::Development {
                             return false;
                         }
+                        // Edges marked `offload = false` do not exist on the
+                        // device. Build-dependencies are host tools and are
+                        // kept, as they are for any cross-compiled crate.
+                        if matches!(fk, FeaturesFor::Offload(_))
+                            && !dep.is_build()
+                            && !dep.offload_included()
+                        {
+                            return false;
+                        }
                         true
                     })
                     .collect_vec() // collect because the next closure mutably borrows `self.target_data`
@@ -912,7 +995,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
                         // for various targets which are either specified in the manifest
                         // or on the cargo command-line.
                         let lib_fk = if fk != FeaturesFor::HostDep
-                            && self.track_for_host
+                            && (self.track_for_host || matches!(fk, FeaturesFor::Offload(_)))
                             && (dep.is_build() || self.has_proc_macro_lib(dep_id))
                         {
                             FeaturesFor::HostDep

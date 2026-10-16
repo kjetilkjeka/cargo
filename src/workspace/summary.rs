@@ -31,6 +31,10 @@ struct Inner {
     links: Option<InternedString>,
     rust_version: Option<RustVersion>,
     pubtime: Option<jiff::Timestamp>,
+    /// `package.offload-default-features` (`-Z offload`): the features that
+    /// stand in for `default` when this package is compiled for an offload
+    /// device. `None` means the device uses the regular `default` feature.
+    offload_default_features: Option<Vec<FeatureValue>>,
 }
 
 /// Indicates the dependency inferred from the `dep` syntax that should exist,
@@ -93,6 +97,7 @@ impl Summary {
                 links: links.map(|l| l.into()),
                 rust_version,
                 pubtime: None,
+                offload_default_features: None,
             }),
         })
     }
@@ -129,6 +134,17 @@ impl Summary {
 
     pub fn pubtime(&self) -> Option<jiff::Timestamp> {
         self.inner.pubtime
+    }
+
+    /// The features used instead of `default` on an offload device, if the
+    /// package declares `offload-default-features`.
+    pub fn offload_default_features(&self) -> Option<&[FeatureValue]> {
+        self.inner.offload_default_features.as_deref()
+    }
+
+    pub fn set_offload_default_features(&mut self, features: Vec<InternedString>) {
+        let fvs = features.into_iter().map(FeatureValue::new).collect();
+        Arc::make_mut(&mut self.inner).offload_default_features = Some(fvs);
     }
 
     pub fn override_id(mut self, id: PackageId) -> Summary {

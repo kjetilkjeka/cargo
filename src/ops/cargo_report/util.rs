@@ -101,6 +101,7 @@ pub fn unit_target_description(target: &Target, mode: CompileMode) -> String {
         CompileMode::Doctest => target_str.push_str(" (doc test)"),
         CompileMode::Docscrape => target_str.push_str(" (doc scrape)"),
         CompileMode::RunCustomBuild => target_str.push_str(" (run)"),
+        CompileMode::OffloadMetadata { .. } => target_str.push_str(" (offload host metadata)"),
     }
 
     target_str

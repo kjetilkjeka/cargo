@@ -63,6 +63,9 @@ pub struct Profiles {
     /// This is here to assist with error reporting, as the `ProfileMaker`
     /// values have the inherits chains all merged together.
     original_profiles: BTreeMap<InternedString, TomlProfile>,
+    /// The offload device target (`-Z offload`), if a device graph is built.
+    /// Units compiled for it get a few settings forced, see `get_profile`.
+    offload_target: Option<CompileTarget>,
     /// The profile the user requested to use.
     requested_profile: InternedString,
     /// The host target for rustc being used by this `Profiles`.
@@ -91,6 +94,7 @@ impl Profiles {
             by_name: HashMap::default(),
             original_profiles: profiles.clone(),
             requested_profile,
+            offload_target: None,
             rustc_host,
             hint_min_opt_level: gctx.cli_unstable().hint_min_opt_level,
         };
@@ -328,6 +332,24 @@ impl Profiles {
         // Incremental can be globally overridden.
         if let Some(v) = self.incremental {
             profile.incremental = v;
+        }
+
+        if let Some(device) = self.offload_target
+            && kind == CompileKind::Target(device)
+        {
+            // Units of the offload device graph end up in one fat-LTO module,
+            // which rustc cannot build incrementally. Debug info is dropped
+            // because ptxas rejects the DWARF sections LLVM emits into PTX.
+            profile.incremental = false;
+            profile.debuginfo = DebugInfo::Resolved(TomlDebugInfo::None);
+            profile.split_debuginfo = None;
+            // The device image must be self-contained, but rustc keeps
+            // `compiler_builtins` out of LTO. Without optimization nothing is
+            // dead-code eliminated, so unused `core` helpers keep referencing
+            // `memcmp` and friends, which then have no definition in the image.
+            if profile.opt_level.as_str() == "0" {
+                profile.opt_level = "1".into();
+            }
         }
 
         // Only enable incremental compilation for sources the user can
@@ -1102,6 +1124,16 @@ pub struct UnitFor {
     /// Note that this target corresponds to the target used to build the units in that
     /// dependency tree, too, but this copy of it is specifically used for feature lookup.
     artifact_target_for_features: Option<CompileTarget>,
+
+    /// Set for device units in the offload device graph.
+    /// It selects the feature context, and it is cleared for build scripts 
+    /// and proc-macros, which are host tools even when a device crate needs them.
+    offload_device_target: Option<CompileTarget>,
+}
+
+pub enum OffloadTarget {
+    Host{device_target: CompileTarget},
+    Device()
 }
 
 /// How Cargo processes the `panic` setting or profiles.
@@ -1132,6 +1164,7 @@ impl UnitFor {
             panic_setting: PanicSetting::ReadProfile,
             root_compile_kind,
             artifact_target_for_features: None,
+            offload_device_target: None,
         }
     }
 
@@ -1150,6 +1183,7 @@ impl UnitFor {
             panic_setting: PanicSetting::AlwaysUnwind,
             root_compile_kind,
             artifact_target_for_features: None,
+            offload_device_target: None,
         }
     }
 
@@ -1167,6 +1201,7 @@ impl UnitFor {
             panic_setting: PanicSetting::AlwaysUnwind,
             root_compile_kind,
             artifact_target_for_features: None,
+            offload_device_target: None,
         }
     }
 
@@ -1191,6 +1226,7 @@ impl UnitFor {
             },
             root_compile_kind,
             artifact_target_for_features: None,
+            offload_device_target: None,
         }
     }
 
@@ -1236,19 +1272,25 @@ impl UnitFor {
         } else {
             self.panic_setting
         };
-        let artifact_target_for_features =
-            // build.rs and proc-macros are always for host.
-            if dep_target.proc_macro() || parent.target.is_custom_build() {
-                None
-            } else {
-                self.artifact_target_for_features
-            };
+        // build.rs and proc-macros are always for host.
+        let for_host_tool = dep_target.proc_macro() || parent.target.is_custom_build();
+        let artifact_target_for_features = if for_host_tool {
+            None
+        } else {
+            self.artifact_target_for_features
+        };
+        let offload_device_target = if for_host_tool {
+            None
+        } else {
+            self.offload_device_target
+        };
         UnitFor {
             host: self.host || dep_for_host,
             host_features,
             panic_setting,
             root_compile_kind,
             artifact_target_for_features,
+            offload_device_target,
         }
     }
 
@@ -1261,7 +1303,22 @@ impl UnitFor {
             panic_setting: PanicSetting::AlwaysUnwind,
             root_compile_kind: self.root_compile_kind,
             artifact_target_for_features: self.artifact_target_for_features,
+            // The build script of a device crate runs with the device
+            // features, just like the build script of a cross-compiled crate.
+            offload_device_target: self.offload_device_target,
         }
+    }
+
+    /// Marks this unit (and its dependency tree) as part of the offload
+    /// device graph for `target`.
+    pub(crate) fn with_offload_device_target(mut self, target: Option<CompileTarget>) -> UnitFor {
+        self.offload_device_target = target;
+        self
+    }
+
+    /// The offload device target, if this unit is in the device graph.
+    pub(crate) fn offload_device_target(&self) -> Option<CompileTarget> {
+        self.offload_device_target
     }
 
     /// Set the artifact compile target for use in features using the given `artifact`.
@@ -1303,15 +1360,24 @@ impl UnitFor {
     /// If we are an artifact but don't specify a `target`, we assume the default
     /// compile kind that is suitable in this situation.
     pub(crate) fn map_to_features_for(&self, dep_artifact: Option<&Artifact>) -> FeaturesFor {
-        FeaturesFor::from_for_host_or_artifact_target(
+        let artifact_target = match dep_artifact {
+            Some(artifact) => artifact
+                .target()
+                .and_then(|t| t.to_resolved_compile_target(self.root_compile_kind)),
+            None => self.artifact_target_for_features,
+        };
+        // Artifact targets are the most specific context; otherwise a device
+        // unit (which is never a host tool) resolves its features in the
+        // offload context.
+        match (
+            artifact_target,
+            self.offload_device_target,
             self.is_for_host_features(),
-            match dep_artifact {
-                Some(artifact) => artifact
-                    .target()
-                    .and_then(|t| t.to_resolved_compile_target(self.root_compile_kind)),
-                None => self.artifact_target_for_features,
-            },
-        )
+        ) {
+            (Some(target), _, _) => FeaturesFor::ArtifactDep(target),
+            (None, Some(target), false) => FeaturesFor::Offload(target),
+            (None, _, for_host) => FeaturesFor::from_for_host(for_host),
+        }
     }
 
     pub(crate) fn root_compile_kind(&self) -> CompileKind {

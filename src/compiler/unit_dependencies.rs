@@ -23,7 +23,9 @@ use crate::CargoResult;
 use crate::compiler::UserIntent;
 use crate::compiler::artifact::match_artifacts_kind_with_targets;
 use crate::compiler::unit_graph::{UnitDep, UnitGraph};
-use crate::compiler::{CompileKind, CompileMode, CrateType, RustcTargetData, Unit, UnitInterner};
+use crate::compiler::{
+    CompileKind, CompileMode, CompileTarget, CrateType, RustcTargetData, Unit, UnitInterner,
+};
 use crate::ops::resolve_all_features;
 use crate::resolver::features::{FeaturesFor, ResolvedFeatures};
 use crate::resolver::{ForceAllTargets, HasDevUnits, Resolve};
@@ -81,6 +83,20 @@ impl IsArtifact {
     }
 }
 
+/// Indicate the role in offload compilation
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OffloadUnit {
+    /// A Unit that act as top level for host offloading code
+    /// 
+    /// A corresponding device unit needs to be created for it.
+    Host,
+
+    /// A unit that contain device offloading code.
+    /// 
+    /// There's a host unit corresponding to this device unit that depend upon it.
+    Device{host_features: Vec<InternedString>},
+}
+
 /// Then entry point for building a dependency graph of compilation units.
 ///
 /// You can find some information for arguments from doc of [`State`].
@@ -108,6 +124,15 @@ pub fn build_unit_dependencies<'a, 'gctx>(
     let (std_resolve, std_features) = match std_resolve {
         Some((r, f)) => (Some(r), Some(f)),
         None => (None, None),
+    };
+    // Only executables embed a device image, so only the intents that
+    // produce executables get the device graph. `cargo check` and `cargo doc`
+    // stay host-only for now.
+    let offload_target = match intent {
+        UserIntent::Build | UserIntent::Test | UserIntent::Bench => {
+            crate::compiler::offload::device_target(ws.gctx())?
+        }
+        UserIntent::Check { .. } | UserIntent::Doc { .. } | UserIntent::Doctest => None,
     };
     let mut state = State {
         ws,
@@ -215,7 +240,11 @@ fn attach_std_deps(
     let mut found = false;
     for (unit, deps) in state.unit_dependencies.iter_mut() {
         if !unit.kind.is_host() && !unit.mode.is_run_custom_build() {
-            deps.extend(std_roots[&unit.kind].iter().map(|unit| UnitDep {
+            // With `-Z offload`, std may be built for the device target only.
+            let Some(roots) = std_roots.get(&unit.kind) else {
+                continue;
+            };
+            deps.extend(roots.iter().map(|unit| UnitDep {
                 unit: unit.clone(),
                 unit_for: UnitFor::new_normal(unit.kind),
                 extern_crate_name: unit.pkg.name(),
@@ -316,11 +345,17 @@ fn compute_deps(
 
     let mut ret = Vec::new();
     let mut dev_deps = Vec::new();
+
+    if let Some(offload_dep) = additional_offload_dep(unit, state, unit_for)? {
+        ret.push(offload_dep);
+    }
+    
     for (dep_pkg_id, deps) in state.deps(unit, unit_for) {
         let Some(dep_lib) = calc_artifact_deps(unit, unit_for, dep_pkg_id, &deps, state, &mut ret)?
         else {
             continue;
         };
+
         let dep_pkg = state.get(dep_pkg_id);
         let mode = check_or_build_mode(unit.mode, dep_lib);
         let dep_unit_for = unit_for.with_dependency(unit, dep_lib, unit_for.root_compile_kind());
@@ -342,6 +377,7 @@ fn compute_deps(
                 unit.kind,
                 mode,
                 IS_NO_ARTIFACT_DEP,
+                None,
             )?;
             ret.push(unit_dep);
             let unit_dep = new_unit_dep(
@@ -354,21 +390,39 @@ fn compute_deps(
                 CompileKind::Host,
                 mode,
                 IS_NO_ARTIFACT_DEP,
+                None,
             )?;
             ret.push(unit_dep);
         } else {
-            let unit_dep = new_unit_dep(
-                state,
-                unit,
-                dep_pkg,
-                dep_lib,
-                Some(manifest_deps),
-                dep_unit_for,
-                unit.kind.for_target(dep_lib),
-                mode,
-                IS_NO_ARTIFACT_DEP,
-            )?;
-            ret.push(unit_dep);
+            if dep_lib.is_lib() && !dep_lib.is_compile_time_dependency()  {
+                let device_unit = new_unit_dep(
+                    state,
+                    unit,
+                    dep_pkg,
+                    dep_lib,
+                    Some(manifest_deps),
+                    dep_unit_for,
+                    unit.kind.for_target(dep_lib),
+                    mode,
+                    IS_NO_ARTIFACT_DEP,
+                    unit.offload.clone(),
+                )?;
+                ret.push(device_unit);
+            } else {
+                let unit_dep = new_unit_dep(
+                    state,
+                    unit,
+                    dep_pkg,
+                    dep_lib,
+                    Some(manifest_deps),
+                    dep_unit_for,
+                    unit.kind.for_target(dep_lib),
+                    mode,
+                    IS_NO_ARTIFACT_DEP,
+                    None,
+                )?;
+                ret.push(unit_dep);
+            }
         }
 
         // If the unit added was a dev-dependency unit, then record that in the
@@ -446,6 +500,7 @@ fn compute_deps(
                         unit.kind.for_target(t),
                         CompileMode::Build,
                         IS_NO_ARTIFACT_DEP,
+                        None,
                     )
                 })
                 .collect::<CargoResult<Vec<UnitDep>>>()?,
@@ -453,6 +508,65 @@ fn compute_deps(
     }
 
     Ok(ret)
+}
+
+/// This function may be called for each unit and will add the extra offload
+/// deps if it is required by the unit
+/// 
+/// A host executable gets two more passes of itself: the host-metadata pass,
+/// which writes the manifest of kernel instantiations, and the device pass,
+/// which compiles the crate for the device target. 
+/// The device pass depends on the host-metadata pass, and the host
+/// executable depends on the device pass.
+fn additional_offload_dep(
+    unit: &Unit,
+    state: &State<'_, '_>,
+    unit_for: UnitFor,
+) -> CargoResult<Option<UnitDep>> {
+    // Add the device dependency unit graph for top level offload host units
+    match unit.offload {
+        Some(OffloadUnit::Host{..}) if unit.target.is_bin() && !unit.mode.is_offload_metadata() => {
+            // TODO: calculate device dependencies
+            let manifest_deps = unit.pkg.dependencies().to_owned();
+            let device_unit_for = unit_for.with_offload_device_target(crate::compiler::offload::device_target(state.gctx)?);
+
+            let Some(device_target) = crate::compiler::offload::device_target(state.gctx)? else {
+                return Err(crate::util::internal(format!("impossible to create device units when no offload target is specified")));
+            };
+
+            let device_kind = CompileKind::Target(device_target);
+
+            Ok(Some(new_unit_dep(
+                state,
+                unit,
+                &unit.pkg,
+                &unit.target,
+                Some(manifest_deps), 
+                device_unit_for,
+                device_kind,
+                unit.mode,
+                IS_NO_ARTIFACT_DEP,
+                Some(OffloadUnit::Device { host_features: unit.features.clone() }),
+            )?))
+        },
+        Some(OffloadUnit::Device{..}) => {
+            let manifest_deps = unit.pkg.dependencies().to_owned();
+
+            Ok(Some(new_unit_dep(
+                state,
+                unit,
+                &unit.pkg,
+                &unit.target,
+                Some(manifest_deps), 
+                unit_for.with_offload_device_target(None),
+                CompileKind::Host, // TODO: Should this be offload host instead of compile host?
+                CompileMode::OffloadMetadata { test: unit.mode.is_rustc_test() },
+                IS_NO_ARTIFACT_DEP,
+                Some(OffloadUnit::Host), // No device code should be generated for the metadata pass
+            )?))
+        },
+        _ => Ok(None)
+    }
 }
 
 /// Find artifacts for all `deps` of `unit` and add units that build these artifacts
@@ -543,6 +657,7 @@ fn compute_deps_custom_build(
         CompileKind::Host,
         CompileMode::Build,
         IS_NO_ARTIFACT_DEP,
+        None,
     )?;
 
     let mut result = vec![compile_script_unit];
@@ -636,6 +751,7 @@ fn artifact_targets_to_unit_deps(
                                     compile_kind,
                                     CompileMode::Build,
                                     dep.artifact(),
+                                    None,
                                 )
                             }),
                     ) as Box<dyn Iterator<Item = _>>,
@@ -649,6 +765,7 @@ fn artifact_targets_to_unit_deps(
                         compile_kind,
                         CompileMode::Build,
                         dep.artifact(),
+                        None,
                     ))),
                 }
             })
@@ -685,6 +802,7 @@ fn compute_deps_doc(
             unit.kind.for_target(dep_lib),
             mode,
             IS_NO_ARTIFACT_DEP,
+            None, // FIXME(@kjetilkjeka) Skip device offload code in doc generation for now
         )?;
         ret.push(lib_unit_dep);
         if dep_lib.documented() && state.intent.wants_deps_docs() {
@@ -699,6 +817,7 @@ fn compute_deps_doc(
                 unit.kind.for_target(dep_lib),
                 unit.mode,
                 IS_NO_ARTIFACT_DEP,
+                None, // FIXME(@kjetilkjeka) Skip device offload code in doc generation for now
             )?;
             ret.push(doc_unit_dep);
         }
@@ -733,6 +852,7 @@ fn compute_deps_doc(
                 unit.kind.for_target(lib),
                 unit.mode,
                 IS_NO_ARTIFACT_DEP,
+                None, // FIXME(@kjetilkjeka) Skip device offload code in doc generation for now
             )?;
             ret.push(lib_doc_unit);
         }
@@ -753,6 +873,7 @@ fn compute_deps_doc(
                 scrape_unit.kind,
                 scrape_unit.mode,
                 IS_NO_ARTIFACT_DEP,
+                None, // FIXME(@kjetilkjeka) Skip device offload code in doc generation for now
             )?);
         }
     }
@@ -782,6 +903,7 @@ fn maybe_lib(
                 unit.kind.for_target(t),
                 mode,
                 IS_NO_ARTIFACT_DEP,
+                None, // FIXME(@kjetilkjeka) Skip device offload code in doc generation for now
             )
         })
         .transpose()
@@ -845,6 +967,7 @@ fn dep_build_script(
                     CompileMode::RunCustomBuild,
                     profile,
                     IS_NO_ARTIFACT_DEP,
+                    None,
                 )
             })
             .collect(),
@@ -881,6 +1004,7 @@ fn new_unit_dep(
     kind: CompileKind,
     mode: CompileMode,
     artifact: Option<&Artifact>,
+    offload: Option<OffloadUnit>,
 ) -> CargoResult<UnitDep> {
     let is_local = pkg.package_id().source_id().is_path() && !state.is_std;
     let profile = state.profiles.get_profile(
@@ -902,6 +1026,7 @@ fn new_unit_dep(
         mode,
         profile,
         artifact,
+        offload,
     )
 }
 
@@ -916,6 +1041,7 @@ fn new_unit_dep_with_profile(
     mode: CompileMode,
     profile: Profile,
     artifact: Option<&Artifact>,
+    offload: Option<OffloadUnit>,
 ) -> CargoResult<UnitDep> {
     let (extern_crate_name, dep_name) = state.resolve().extern_crate_name_and_dep_name(
         parent.pkg.package_id(),
@@ -950,6 +1076,7 @@ fn new_unit_dep_with_profile(
         artifact.map_or(IsArtifact::No, |_| IsArtifact::Yes),
         artifact_target,
         false,
+        offload,
     );
     Ok(UnitDep {
         unit,
@@ -1163,6 +1290,15 @@ impl<'a, 'gctx> State<'a, 'gctx> {
                         // If this dependency is only available for certain platforms,
                         // make sure we're only enabling it for that platform.
                         if !self.target_data.dep_platform_activated(dep, kind) {
+                            return false;
+                        }
+
+                        // Edges marked `offload = false` do not exist in the
+                        // device graph. This mirrors the feature resolver.
+                        if unit_for.offload_device_target().is_some()
+                            && !dep.is_build()
+                            && !dep.offload_included()
+                        {
                             return false;
                         }
 

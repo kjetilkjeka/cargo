@@ -2,6 +2,7 @@
 
 use crate::compiler::BuildConfig;
 use crate::compiler::CompileKind;
+use crate::compiler::CompileTarget;
 use crate::compiler::Unit;
 use crate::compiler::UnitIndex;
 use crate::compiler::unit_graph::UnitGraph;
@@ -93,6 +94,9 @@ pub struct BuildContext<'a, 'gctx> {
 
     /// The list of all kinds that are involved in this build
     pub all_kinds: HashSet<CompileKind>,
+
+    /// The offload device target (`-Z offload` with `offload.target` set).
+    pub offload_target: Option<CompileTarget>,
 }
 
 impl<'a, 'gctx> BuildContext<'a, 'gctx> {
@@ -116,6 +120,7 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
             .chain(build_config.requested_kinds.iter().copied())
             .chain(std::iter::once(CompileKind::Host))
             .collect();
+        let offload_target = crate::compiler::offload::device_target(ws.gctx())?;
 
         Ok(BuildContext {
             ws,
@@ -132,6 +137,7 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
             unit_to_index,
             scrape_units,
             all_kinds,
+            offload_target,
         })
     }
 

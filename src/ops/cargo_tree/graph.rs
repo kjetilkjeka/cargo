@@ -416,7 +416,9 @@ fn add_pkg(
     let node_features = resolved_features.activated_features(package_id, features_for);
     let node_kind = match features_for {
         FeaturesFor::HostDep => CompileKind::Host,
-        FeaturesFor::ArtifactDep(target) => CompileKind::Target(target),
+        FeaturesFor::ArtifactDep(target) | FeaturesFor::Offload(target) => {
+            CompileKind::Target(target)
+        }
         FeaturesFor::NormalOrDev => requested_kind,
     };
     let node = Node::Package {

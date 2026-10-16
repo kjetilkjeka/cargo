@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use super::BuildOutput;
 use crate::compiler::unit_dependencies::IsArtifact;
+use crate::compiler::unit_dependencies::OffloadUnit;
 use crate::compiler::{CompileKind, CompileMode, CompileTarget, CrateType};
 use crate::util::GlobalContext;
 use crate::util::data_structures::HashSet;
@@ -110,6 +111,8 @@ pub struct UnitInner {
     // if `true`, the dependency is an artifact dependency, requiring special handling when
     // calculating output directories, linkage and environment variables provided to builds.
     pub artifact: IsArtifact,
+    /// This units role in offload compilation.
+    pub offload: Option<OffloadUnit>,
     /// Whether this is a standard library unit.
     pub is_std: bool,
     /// A hash of all dependencies of this unit.
@@ -168,6 +171,16 @@ impl UnitInner {
     /// Returns whether or not warnings should be displayed for this unit.
     pub fn show_warnings(&self, gctx: &GlobalContext) -> bool {
         self.is_local() || gctx.extra_verbose()
+    }
+
+    /// Returns true if this unit is for a offload device part  
+    pub fn is_offload_device(&self) -> bool {
+        matches!(self.offload, Some(OffloadUnit::Device{..}))
+    }
+
+    /// Returns true if this unit is part of an offload build as a host part
+    pub fn is_offload_host(&self) -> bool {
+        self.offload == Some(OffloadUnit::Host)
     }
 }
 
@@ -262,6 +275,7 @@ impl UnitInterner {
         artifact: IsArtifact,
         artifact_target_for_features: Option<CompileTarget>,
         skip_non_compile_time_dep: bool,
+        offload: Option<OffloadUnit>,
     ) -> Unit {
         let target = match (is_std, target.kind()) {
             // This is a horrible hack to support build-std. `libstd` declares
@@ -297,6 +311,7 @@ impl UnitInterner {
             is_std,
             dep_hash,
             artifact,
+            offload,
             artifact_target_for_features,
             skip_non_compile_time_dep,
         });

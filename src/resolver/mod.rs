@@ -397,7 +397,7 @@ fn activate_deps_loop(
                 dev_deps: false,
                 features: RequestedFeatures::DepFeatures {
                     features: Rc::clone(&features),
-                    uses_default_features: dep.uses_default_features(),
+                    uses_default_features: dep.uses_default_features_any_side(),
                 },
             };
             trace!(

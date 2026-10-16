@@ -52,6 +52,29 @@ struct Inner {
     // This dependency should be used only for this platform.
     // `None` means *all platforms*.
     platform: Option<Platform>,
+
+    // How this edge participates in the offload device graph (`-Z offload`).
+    offload: OffloadRequest,
+}
+
+/// How a dependency edge participates in the offload device graph.
+///
+/// This mirrors the `offload` key of a dependency entry. The host request
+/// (`features` / `default-features`) is never changed by it; the device
+/// context either reuses that request, drops the edge, or replaces it.
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Default)]
+pub enum OffloadRequest {
+    /// The device graph uses the same feature request as the host.
+    #[default]
+    Inherit,
+    /// The edge does not exist in the device graph.
+    Exclude,
+    /// The edge exists in the device graph with this request, replacing the
+    /// host request.
+    Replace {
+        default_features: bool,
+        features: Vec<InternedString>,
+    },
 }
 
 #[derive(Serialize)]
@@ -163,6 +186,7 @@ impl Dependency {
                 platform: None,
                 explicit_name_in_toml: None,
                 artifact: None,
+                offload: OffloadRequest::Inherit,
             }),
         }
     }
@@ -420,6 +444,49 @@ impl Dependency {
     /// Returns the list of features that are requested by the dependency.
     pub fn features(&self) -> &[InternedString] {
         &self.inner.features
+    }
+
+    /// The `offload` request of this edge (`-Z offload`).
+    pub fn offload(&self) -> &OffloadRequest {
+        &self.inner.offload
+    }
+
+    pub fn set_offload(&mut self, offload: OffloadRequest) -> &mut Dependency {
+        Arc::make_mut(&mut self.inner).offload = offload;
+        self
+    }
+
+    /// Whether this edge exists in the offload device graph.
+    pub fn offload_included(&self) -> bool {
+        !matches!(self.inner.offload, OffloadRequest::Exclude)
+    }
+
+    /// Whether the default features are requested on the device side of this edge.
+    pub fn offload_uses_default_features(&self) -> bool {
+        match &self.inner.offload {
+            OffloadRequest::Inherit => self.inner.default_features,
+            OffloadRequest::Exclude => false,
+            OffloadRequest::Replace {
+                default_features, ..
+            } => *default_features,
+        }
+    }
+
+    /// The features requested on the device side of this edge.
+    pub fn offload_features(&self) -> &[InternedString] {
+        match &self.inner.offload {
+            OffloadRequest::Inherit => &self.inner.features,
+            OffloadRequest::Exclude => &[],
+            OffloadRequest::Replace { features, .. } => features,
+        }
+    }
+
+    /// Whether the default features are requested by either side of this edge.
+    ///
+    /// The version resolver (phase 1) sees the union of both requests so that
+    /// optional dependencies needed only on the device end up in the resolve.
+    pub fn uses_default_features_any_side(&self) -> bool {
+        self.inner.default_features || self.offload_uses_default_features()
     }
 
     /// Returns `true` if the package (`sum`) can fulfill this dependency request.

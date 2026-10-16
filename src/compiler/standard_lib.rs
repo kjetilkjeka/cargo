@@ -212,6 +212,7 @@ fn generate_roots(
                 IsArtifact::No,
                 None,
                 false,
+                None, // TODO: Can we turn of offload in root? Probably not
             ));
         }
     }

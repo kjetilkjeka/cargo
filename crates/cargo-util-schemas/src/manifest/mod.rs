@@ -200,6 +200,9 @@ pub struct TomlPackage {
     pub autotests: Option<bool>,
     pub autobenches: Option<bool>,
     pub default_run: Option<String>,
+    /// Feature list used instead of `default` when this package is compiled
+    /// for an offload device (`-Z offload`).
+    pub offload_default_features: Option<Vec<String>>,
 
     // Package metadata.
     pub description: Option<InheritableString>,
@@ -730,6 +733,7 @@ pub struct TomlInheritedDependency {
     pub default_features2: Option<bool>,
     pub optional: Option<bool>,
     pub public: Option<bool>,
+    pub offload: Option<TomlOffload>,
 
     /// This is here to provide a way to see the "unused manifest keys" when deserializing
     #[serde(skip_serializing)]
@@ -872,11 +876,63 @@ pub struct TomlDetailedDependency<P: Clone = String> {
     /// A platform name, like `x86_64-apple-darwin`
     pub target: Option<String>,
 
+    /// How this dependency participates in the offload device graph (`-Z offload`).
+    ///
+    /// Absent: same request as on the host. `false`: excluded from the device
+    /// graph. A table: the feature request is replaced for the device.
+    pub offload: Option<TomlOffload>,
+
     /// This is here to provide a way to see the "unused manifest keys" when deserializing
     #[serde(skip_serializing)]
     #[serde(flatten)]
     #[cfg_attr(feature = "unstable-schema", schemars(skip))]
     pub _unused_keys: BTreeMap<String, toml::Value>,
+}
+
+/// The `offload` key of a dependency entry (`-Z offload`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+pub enum TomlOffload {
+    /// `offload = false`: the dependency is not part of the device graph.
+    Exclude(bool),
+    /// `offload = { default-features = <bool>, features = [...] }`: the
+    /// dependency is part of the device graph with this feature request,
+    /// which replaces (not merges with) the host request.
+    Request(TomlOffloadRequest),
+}
+
+impl<'de> de::Deserialize<'de> for TomlOffload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let expected =
+            "`false` or a table like { default-features = false, features = [\"libm\"] }";
+        UntaggedEnumVisitor::new()
+            .expecting(expected)
+            .bool(|value| {
+                if value {
+                    Err(serde_untagged::de::Error::custom(
+                        "`offload = true` is redundant; omit the key to use the host request on the device",
+                    ))
+                } else {
+                    Ok(TomlOffload::Exclude(false))
+                }
+            })
+            .map(|value| value.deserialize().map(TomlOffload::Request))
+            .deserialize(deserializer)
+    }
+}
+
+/// The table form of the `offload` dependency key.
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+pub struct TomlOffloadRequest {
+    pub default_features: bool,
+    pub features: Option<Vec<String>>,
 }
 
 fn deserialize_builtin<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
@@ -916,6 +972,7 @@ impl<P: Clone> Default for TomlDetailedDependency<P> {
             artifact: Default::default(),
             lib: Default::default(),
             target: Default::default(),
+            offload: Default::default(),
             _unused_keys: Default::default(),
         }
     }

@@ -1,4 +1,4 @@
-use crate::compiler::CompileKind;
+use crate::compiler::{CompileKind, CompileTarget};
 use crate::context::JobsConfig;
 use crate::util::interning::InternedString;
 use crate::util::{CargoResult, GlobalContext, RustfixDiagnosticServer};
@@ -50,6 +50,8 @@ pub struct BuildConfig {
     pub sbom: bool,
     /// Build compile time dependencies only, e.g., build scripts and proc macros
     pub compile_time_deps_only: bool,
+    /// Offload compilation to the provided target is enabled
+    pub offload: Option<CompileTarget>,
 }
 
 fn default_parallelism() -> CargoResult<u32> {
@@ -112,6 +114,7 @@ impl BuildConfig {
             }
             (None, _) => false,
         };
+        let offload_target = crate::compiler::offload::device_target(gctx)?;
 
         Ok(BuildConfig {
             requested_kinds,
@@ -130,6 +133,7 @@ impl BuildConfig {
             timing_report: false,
             sbom,
             compile_time_deps_only: false,
+            offload: offload_target,
         })
     }
 
@@ -184,6 +188,13 @@ pub enum CompileMode {
     Docscrape,
     /// Execute the binary built from the `build.rs` script.
     RunCustomBuild,
+    /// First offload pass (`-Z offload`): compile an executable for the host
+    /// without codegen, writing the manifest of kernel instantiations the
+    /// host code needs.
+    ///
+    /// `test` mirrors the root unit: it is `true` when the root is a `--test`
+    /// executable, so the manifest also covers kernels launched from tests.
+    OffloadMetadata { test: bool },
 }
 
 impl ser::Serialize for CompileMode {
@@ -200,6 +211,7 @@ impl ser::Serialize for CompileMode {
             Doctest => "doctest".serialize(s),
             Docscrape => "docscrape".serialize(s),
             RunCustomBuild => "run-custom-build".serialize(s),
+            OffloadMetadata { .. } => "offload-metadata".serialize(s),
         }
     }
 }
@@ -218,6 +230,7 @@ impl<'de> serde::Deserialize<'de> for CompileMode {
             "doctest" => Ok(CompileMode::Doctest),
             "docscrape" => Ok(CompileMode::Docscrape),
             "run-custom-build" => Ok(CompileMode::RunCustomBuild),
+            "offload-metadata" => Ok(CompileMode::OffloadMetadata { test: false }),
             other => Err(serde::de::Error::unknown_variant(
                 other,
                 &[
@@ -228,6 +241,7 @@ impl<'de> serde::Deserialize<'de> for CompileMode {
                     "doctest",
                     "docscrape",
                     "run-custom-build",
+                    "offload-metadata",
                 ],
             )),
         }
@@ -260,13 +274,26 @@ impl CompileMode {
     pub fn is_any_test(self) -> bool {
         matches!(
             self,
-            CompileMode::Test | CompileMode::Check { test: true } | CompileMode::Doctest
+            CompileMode::Test
+                | CompileMode::Check { test: true }
+                | CompileMode::Doctest
+                | CompileMode::OffloadMetadata { test: true }
         )
     }
 
     /// Returns `true` if this is something that passes `--test` to rustc.
     pub fn is_rustc_test(self) -> bool {
-        matches!(self, CompileMode::Test | CompileMode::Check { test: true })
+        matches!(
+            self,
+            CompileMode::Test
+                | CompileMode::Check { test: true }
+                | CompileMode::OffloadMetadata { test: true }
+        )
+    }
+
+    /// Returns `true` if this is the host-metadata pass of an offload build.
+    pub fn is_offload_metadata(self) -> bool {
+        matches!(self, CompileMode::OffloadMetadata { .. })
     }
 
     /// Returns `true` if this is the *execution* of a `build.rs` script.

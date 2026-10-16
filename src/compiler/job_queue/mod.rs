@@ -419,6 +419,8 @@ impl<'gctx> JobQueue<'gctx> {
                 (!dep.unit.target.is_test() && !dep.unit.target.is_bin())
                     || dep.unit.artifact.is_true()
                     || dep.unit.mode.is_doc_scrape()
+                    || dep.unit.mode.is_offload_metadata()
+                    || dep.unit.is_offload_device()
             })
             .map(|dep| {
                 // Handle the case here where our `unit -> dep` dependency may

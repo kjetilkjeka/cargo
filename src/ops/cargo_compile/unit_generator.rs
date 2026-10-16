@@ -1,3 +1,4 @@
+use crate::compiler::CompileTarget;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::cell::RefCell;
 use std::fmt::Write;
@@ -5,7 +6,7 @@ use std::fmt::Write;
 use crate::compiler::DepKindSet;
 use crate::compiler::UserIntent;
 use crate::compiler::rustdoc::RustdocScrapeExamples;
-use crate::compiler::unit_dependencies::IsArtifact;
+use crate::compiler::unit_dependencies::{IsArtifact, OffloadUnit};
 use crate::compiler::{CompileKind, CompileMode, Unit};
 use crate::compiler::{RustcTargetData, UnitInterner};
 use crate::resolver::features::{self, FeaturesFor};
@@ -63,6 +64,7 @@ pub struct UnitGenerator<'a, 'gctx> {
     pub profiles: &'a Profiles,
     pub interner: &'a UnitInterner,
     pub has_dev_units: HasDevUnits,
+    pub offload: Option<CompileTarget>,
 }
 
 impl<'a> UnitGenerator<'a, '_> {
@@ -170,6 +172,7 @@ impl<'a> UnitGenerator<'a, '_> {
                     IsArtifact::No,
                     None,
                     false,
+                    self.offload.map(|_| OffloadUnit::Host),
                 )
             })
             .collect()

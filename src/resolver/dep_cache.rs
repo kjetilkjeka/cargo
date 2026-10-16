@@ -385,6 +385,11 @@ pub fn resolve_features<'b>(
             .unwrap_or(&default_dep)
             .clone();
         base.extend(dep.features().iter());
+        // The version resolve sees the union of the host and device requests
+        // so that optional dependencies needed only on the device are part of
+        // the resolve (and the lockfile). Which side gets what is decided by
+        // the feature resolver afterwards.
+        base.extend(dep.offload_features().iter());
         ret.push((dep.clone(), Rc::new(base)));
     }
 
@@ -418,6 +423,15 @@ fn build_requirements<'a, 'b: 'a>(
         if uses_default_features && s.features().contains_key("default") {
             if let Err(e) = reqs.require_feature(INTERNED_DEFAULT) {
                 return Err(e.into_activate_error(parent, s));
+            }
+        }
+        // The device may substitute `offload-default-features` for `default`;
+        // the version resolve needs the union of both (see `resolve_features`).
+        if uses_default_features {
+            for fv in s.offload_default_features().into_iter().flatten() {
+                if let Err(e) = reqs.require_value(fv) {
+                    return Err(e.into_activate_error(parent, s));
+                }
             }
         }
         Ok(())

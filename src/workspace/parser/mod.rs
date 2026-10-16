@@ -32,7 +32,7 @@ use crate::sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY};
 use crate::util::errors::{CargoResult, ManifestError};
 use crate::util::interning::InternedString;
 use crate::util::{self, GlobalContext, IntoUrl, OnceExt, OptVersionReq};
-use crate::workspace::dependency::{Artifact, ArtifactTarget, DepKind};
+use crate::workspace::dependency::{Artifact, ArtifactTarget, DepKind, OffloadRequest};
 use crate::workspace::manifest::{ManifestMetadata, TargetSourcePath};
 use crate::workspace::{
     CliUnstable, FeatureValue, Patch, PatchLocation, find_workspace_root, resolve_relative_path,
@@ -749,6 +749,7 @@ fn normalize_package_toml<'a>(
     let autotests = Some(false);
     let autobenches = Some(false);
     let default_run = original_package.default_run.clone();
+    let offload_default_features = original_package.offload_default_features.clone();
     let description = original_package
         .description
         .clone()
@@ -839,6 +840,7 @@ fn normalize_package_toml<'a>(
         autotests,
         autobenches,
         default_run,
+        offload_default_features,
         description,
         homepage,
         documentation,
@@ -1232,6 +1234,7 @@ fn inner_dependency_inherit_with<'a>(
         default_features,
         default_features2,
         public,
+        offload,
 
         _unused_keys: _,
     } = &pkg_dep;
@@ -1276,6 +1279,7 @@ fn inner_dependency_inherit_with<'a>(
     };
     merged_dep.optional = *optional;
     merged_dep.public = *public;
+    merged_dep.offload = offload.clone().or(merged_dep.offload);
     Ok(manifest::TomlDependency::Detailed(merged_dep))
 }
 
@@ -1478,6 +1482,7 @@ pub fn to_real_manifest(
                 autotests,
                 autobenches,
                 default_run,
+                offload_default_features: _,
                 description: _,
                 homepage: _,
                 documentation: _,
@@ -1804,6 +1809,17 @@ pub fn to_real_manifest(
             }
         }
         summary?
+    };
+    let summary = match &normalized_package.offload_default_features {
+        Some(list) => {
+            if !gctx.cli_unstable().offload {
+                bail!("`package.offload-default-features` requires `-Z offload`");
+            }
+            let mut summary = summary;
+            summary.set_offload_default_features(list.iter().map(InternedString::from).collect());
+            summary
+        }
+        None => summary,
     };
 
     if summary.features().contains_key("default-features") {
@@ -2386,6 +2402,50 @@ fn dep_to_dependency<P: ResolveToPath + Clone>(
     if let Some(p) = orig.public {
         dep.set_public(p);
     }
+
+    let offload = match &orig.offload {
+        None => match kind {
+            // Dev-dependencies take part in the device graph only when asked to.
+            Some(DepKind::Development) => OffloadRequest::Exclude,
+            _ => OffloadRequest::Inherit,
+        },
+        Some(offload) => {
+            if !manifest_ctx.gctx.cli_unstable().offload {
+                bail!("`offload = …` requires `-Z offload` ({})", name_in_toml);
+            }
+            if kind == Some(DepKind::Build) {
+                bail!(
+                    "`offload` is not allowed on build-dependencies ({})",
+                    name_in_toml
+                );
+            }
+            match offload {
+                manifest::TomlOffload::Exclude(_) => OffloadRequest::Exclude,
+                manifest::TomlOffload::Request(request) => {
+                    for feature in request.features.iter().flatten() {
+                        if feature.contains('/') || feature.starts_with("dep:") {
+                            bail!(
+                                "feature `{}` in `offload` of dependency `{}` is not allowed to \
+                                 contain slashes or use explicit `dep:` syntax",
+                                feature,
+                                name_in_toml
+                            );
+                        }
+                    }
+                    OffloadRequest::Replace {
+                        default_features: request.default_features,
+                        features: request
+                            .features
+                            .iter()
+                            .flatten()
+                            .map(InternedString::from)
+                            .collect(),
+                    }
+                }
+            }
+        }
+    };
+    dep.set_offload(offload);
 
     if let (Some(artifact), is_lib, target) = (
         orig.artifact.as_ref(),
@@ -3313,6 +3373,11 @@ fn prepare_toml_for_publish(
                 // registry specifications are elaborated to the index URL
                 if let Some(registry) = d.registry.take() {
                     d.registry_index = Some(gctx.get_registry_index(&registry)?.to_string());
+                }
+                if d.offload.is_some() {
+                    anyhow::bail!(
+                        "dependencies using the `offload` key cannot be published yet (`-Z offload` prototype)"
+                    );
                 }
                 Ok(d)
             }

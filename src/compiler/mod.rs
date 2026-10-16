@@ -43,6 +43,7 @@ pub(crate) mod layout;
 mod links;
 mod locking;
 mod lto;
+pub mod offload;
 mod output_depinfo;
 mod output_sbom;
 pub mod rustdoc;
@@ -54,6 +55,7 @@ pub mod unit_dependencies;
 pub mod unit_graph;
 pub mod unused_deps;
 
+use crate::compiler::unit_dependencies::OffloadUnit;
 use crate::util::data_structures::{HashMap, HashSet};
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -1363,7 +1365,14 @@ fn build_base_args(
         }
     }
 
-    if unit.mode.is_check() {
+    if unit.mode.is_offload_metadata() {
+        // rustc skips codegen and linking for this pass and only writes the
+        // kernel manifest. `link` is still requested because with a
+        // metadata-only output rustc treats no `#[no_mangle]` function as
+        // reachable, so launches in e.g. a `#![no_main]` crate's `main` would
+        // be missing from the manifest.
+        cmd.arg("--emit=dep-info,link");
+    } else if unit.mode.is_check() {
         cmd.arg("--emit=dep-info,metadata");
     } else if !build_runner
         .bcx
@@ -1498,6 +1507,16 @@ fn build_base_args(
 
     cmd.args(&features_args(unit));
     cmd.args(&check_cfg_args(unit));
+    if let Some(device) = bcx.offload_target {
+        if !unit.is_std {
+            cmd.arg("--check-cfg")
+                .arg(format!("cfg({})", offload::DEVICE_CFG));
+            if let Some(OffloadUnit::Device { .. }) = unit.offload {
+                cmd.arg("--cfg").arg(offload::DEVICE_CFG);
+            }
+        }
+    }
+    cmd.args(&offload::rustc_args(build_runner, unit)?);
 
     let meta = build_runner.files().metadata(unit);
     cmd.arg("-C")
